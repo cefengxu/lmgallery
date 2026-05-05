@@ -9,6 +9,25 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
 const PEXELS_SEARCH = 'https://api.pexels.com/v1/search';
 
+/** 监听端口：云端可在 .env 中设置 PORT（<1024 需具备绑定特权端口权限）。 */
+function listenPortFromEnv(): number {
+  const raw = process.env.PORT?.trim();
+  if (raw === undefined || raw === '') return 3738;
+  const n = Number.parseInt(raw, 10);
+  if (!Number.isFinite(n) || n < 1 || n > 65535) return 3738;
+  return n;
+}
+
+/**
+ * 应用的对外访问基准 URL（无则回退为 http://localhost:<PORT>），用于启动日志等。
+ * 云端示例：APP_BASE_URL=http://18.222.221.196:3738
+ */
+function appPublicBaseUrl(port: number): string {
+  const raw = process.env.APP_BASE_URL?.trim();
+  if (!raw) return `http://localhost:${port}`;
+  return raw.replace(/\/+$/, '');
+}
+
 /** Env keys must be named PEXELS_API_KEY_1, PEXELS_API_KEY_2, … (numeric suffix). Re-read on every request. */
 function collectPexelsApiKeys(): string[] {
   const entries: { order: number; key: string }[] = [];
@@ -124,105 +143,184 @@ function pickPexelsMainImage(
   return { url: fallback, width: w, height: h };
 }
 
+/** 与 UI / GET /api/search 共用：单张检索结果（image 为可直接下载的主图 CDN URL）。 */
+export type GallerySearchResultItem = {
+  title: string;
+  image: string;
+  thumbnail: string;
+  url: string;
+  height: number;
+  width: number;
+  source: string;
+};
+
+type PexelsPhotosResponse = {
+  photos?: Array<{
+    id: number;
+    width: number;
+    height: number;
+    url: string;
+    photographer: string;
+    alt?: string;
+    src: Record<string, string>;
+  }>;
+};
+
+type SearchOk = { ok: true; query: string; results: GallerySearchResultItem[] };
+type SearchErr = {
+  ok: false;
+  status: number;
+  body: { error: string };
+};
+
+/**
+ * 执行一次与前端检索相同的 Pexels 查询（per_page、orientation、主图档位等与 GET /api/search 一致）。
+ */
+async function runGalleryImageSearch(query: string): Promise<SearchOk | SearchErr> {
+  const trimmed = query.trim();
+  if (!trimmed) {
+    return {
+      ok: false,
+      status: 400,
+      body: { error: 'Missing search keyword (use q or keyword).' },
+    };
+  }
+
+  const keys = collectPexelsApiKeys();
+  if (keys.length === 0) {
+    return {
+      ok: false,
+      status: 500,
+      body: {
+        error:
+          'No Pexels API keys. Set PEXELS_API_KEY_1 (and optionally PEXELS_API_KEY_2, …) in .env.',
+      },
+    };
+  }
+
+  const startSlot = pexelsKeyRoundRobin % keys.length;
+  pexelsKeyRoundRobin += 1;
+
+  const imageMaxEdge = pexelsImageMaxEdgeFromEnv();
+
+  for (let offset = 0; offset < keys.length; offset++) {
+    const apiKey = keys[(startSlot + offset) % keys.length];
+
+    try {
+      const { data } = await axios.get<PexelsPhotosResponse>(PEXELS_SEARCH, {
+        params: {
+          query: trimmed,
+          per_page: PEXELS_PER_PAGE,
+          page: 1,
+          orientation: 'landscape',
+        },
+        headers: {
+          Authorization: apiKey,
+        },
+        timeout: 30_000,
+      });
+
+      const photos = data.photos ?? [];
+      const results: GallerySearchResultItem[] = photos.map((photo) => {
+        const main = pickPexelsMainImage(photo, imageMaxEdge);
+        return {
+          title:
+            (photo.alt && photo.alt.trim()) ||
+            `Photo by ${photo.photographer}`,
+          image: main.url,
+          thumbnail: photo.src.tiny || photo.src.small || photo.src.medium,
+          url: photo.url,
+          height: main.height,
+          width: main.width,
+          source: photo.photographer || 'Pexels',
+        };
+      });
+
+      return { ok: true, query: trimmed, results };
+    } catch (error: unknown) {
+      const err = error as {
+        message?: string;
+        response?: { status?: number; data?: { error?: string } };
+      };
+      const status = err.response?.status;
+      const retryWithNextKey = status === 429 || status === 401;
+      if (retryWithNextKey && offset < keys.length - 1) {
+        console.warn(
+          `[pexels] HTTP ${status} with key slot ${((startSlot + offset) % keys.length) + 1}, trying next key…`,
+        );
+        continue;
+      }
+
+      const detail =
+        err.response?.data?.error || err.message || 'Request failed';
+      console.error('Search error:', detail);
+
+      if (status === 401) {
+        return {
+          ok: false,
+          status: 401,
+          body: {
+            error:
+              'Invalid or unauthorized Pexels API key (all keys exhausted).',
+          },
+        };
+      }
+      return {
+        ok: false,
+        status: 500,
+        body: { error: 'Failed to fetch images from Pexels.' },
+      };
+    }
+  }
+
+  return {
+    ok: false,
+    status: 500,
+    body: { error: 'Failed to fetch images from Pexels.' },
+  };
+}
+
+/** GET/POST 共用响应：results 项与前端 SearchResult 一致；image 为主图 CDN 直链（可与 UI 下载行为一致）。 */
+function jsonSearchPayload(query: string, results: GallerySearchResultItem[]) {
+  return {
+    query,
+    count: results.length,
+    results,
+  };
+}
+
 async function startServer() {
   const app = express();
-  const PORT = 3000;
+  const PORT = listenPortFromEnv();
+  const publicUrl = appPublicBaseUrl(PORT);
+
+  app.use(express.json());
 
   app.get('/api/search', async (req, res) => {
     const query = (req.query.q as string)?.trim();
     if (!query) {
       return res.status(400).json({ error: 'Missing query parameter q' });
     }
-
-    const keys = collectPexelsApiKeys();
-    if (keys.length === 0) {
-      return res.status(500).json({
-        error:
-          'No Pexels API keys. Set PEXELS_API_KEY_1 (and optionally PEXELS_API_KEY_2, …) in .env.',
-      });
+    const out = await runGalleryImageSearch(query);
+    if (!out.ok) {
+      return res.status(out.status).json(out.body);
     }
+    return res.json(jsonSearchPayload(out.query, out.results));
+  });
 
-    const startSlot = pexelsKeyRoundRobin % keys.length;
-    pexelsKeyRoundRobin += 1;
-
-    const imageMaxEdge = pexelsImageMaxEdgeFromEnv();
-
-    type PexelsPhotosResponse = {
-      photos?: Array<{
-        id: number;
-        width: number;
-        height: number;
-        url: string;
-        photographer: string;
-        alt?: string;
-        src: Record<string, string>;
-      }>;
-    };
-
-    for (let offset = 0; offset < keys.length; offset++) {
-      const apiKey = keys[(startSlot + offset) % keys.length];
-
-      try {
-        const { data } = await axios.get<PexelsPhotosResponse>(PEXELS_SEARCH, {
-          params: {
-            query,
-            per_page: PEXELS_PER_PAGE,
-            page: 1,
-            // https://www.pexels.com/api/documentation/#photos-search — landscape | portrait | square
-            orientation: 'landscape',
-          },
-          headers: {
-            Authorization: apiKey,
-          },
-          timeout: 30_000,
-        });
-
-        const photos = data.photos ?? [];
-        const images = photos.map((photo) => {
-          const main = pickPexelsMainImage(photo, imageMaxEdge);
-          return {
-            title:
-              (photo.alt && photo.alt.trim()) ||
-              `Photo by ${photo.photographer}`,
-            image: main.url,
-            thumbnail:
-              photo.src.tiny || photo.src.small || photo.src.medium,
-            url: photo.url,
-            height: main.height,
-            width: main.width,
-            source: photo.photographer || 'Pexels',
-          };
-        });
-
-        return res.json({ results: images });
-      } catch (error: unknown) {
-        const err = error as {
-          message?: string;
-          response?: { status?: number; data?: { error?: string } };
-        };
-        const status = err.response?.status;
-        const retryWithNextKey = status === 429 || status === 401;
-        if (retryWithNextKey && offset < keys.length - 1) {
-          console.warn(
-            `[pexels] HTTP ${status} with key slot ${((startSlot + offset) % keys.length) + 1}, trying next key…`,
-          );
-          continue;
-        }
-
-        const detail =
-          err.response?.data?.error || err.message || 'Request failed';
-        console.error('Search error:', detail);
-
-        if (status === 401) {
-          return res.status(401).json({
-            error: 'Invalid or unauthorized Pexels API key (all keys exhausted).',
-          });
-        }
-        return res.status(500).json({ error: 'Failed to fetch images from Pexels.' });
-      }
+  app.post('/api/search', async (req, res) => {
+    const body = req.body as { q?: unknown; keyword?: unknown } | undefined;
+    const qRaw =
+      typeof body?.q === 'string'
+        ? body.q
+        : typeof body?.keyword === 'string'
+          ? body.keyword
+          : '';
+    const out = await runGalleryImageSearch(qRaw);
+    if (!out.ok) {
+      return res.status(out.status).json(out.body);
     }
-
-    return res.status(500).json({ error: 'Failed to fetch images from Pexels.' });
+    return res.json(jsonSearchPayload(out.query, out.results));
   });
 
   // Vite middleware for development
@@ -241,7 +339,8 @@ async function startServer() {
   }
 
   app.listen(PORT, '0.0.0.0', () => {
-    console.log(`Server running on http://localhost:${PORT}`);
+    console.log(`Server listening on 0.0.0.0:${PORT}`);
+    console.log(`Public base URL: ${publicUrl}`);
   });
 }
 
