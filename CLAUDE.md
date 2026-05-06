@@ -34,7 +34,11 @@ APP_BASE_URL=                  # optional public URL
 
 ### Backend (`server.ts`)
 
-Express server exposes `/api/search` (GET `?q=` and POST `{ q | keyword }`). It:
+Express server exposes:
+- `/api/search/pexels` and `/api/search/unsplash` (GET `?q=` and POST `{ q | keyword }`) for a single provider
+- `/api/search/combined` — parallel Pexels + Unsplash, total count from `PEXELS_PER_PAGE`, random **5:5** or **4:6** split, merged and shuffled (used by the SPA)
+
+Pexels single-provider handler:
 - Rotates across multiple `PEXELS_API_KEY_N` env vars using round-robin to stay within rate limits
 - Calls the Pexels v1 search API via axios
 - Picks the optimal image CDN variant based on `PEXELS_IMAGE_MAX_EDGE`
@@ -45,7 +49,7 @@ In production, Express also serves the static `dist/` build with SPA fallback.
 ### Frontend (`src/`)
 
 Single-component app (`App.tsx`) with:
-- Search input → `GET /api/search?q=`
+- Search input → `GET /api/search/combined?q=` (both platforms per search)
 - Three-tier results layout: feature image (7/12 cols), secondary pair (5/12 cols), grid of remaining items
 - Lightbox modal for expanded view
 - Client-side file download

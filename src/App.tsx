@@ -3,6 +3,11 @@ import { Search, Download, ExternalLink, Image as ImageIcon, Loader2, Compass, M
 import { motion, AnimatePresence } from 'motion/react';
 import { cn } from './lib/utils';
 
+type GalleryStock = 'pexels' | 'unsplash';
+
+/** 本次搜索响应来源（合并 Lookups 为 mixed） */
+type GalleryImageProvider = GalleryStock | 'mixed';
+
 interface SearchResult {
   title: string;
   image: string;
@@ -11,11 +16,59 @@ interface SearchResult {
   height: number;
   width: number;
   source: string;
+  stock: GalleryStock;
+  photographerUrl: string;
+  unsplashDownloadLocation?: string;
 }
 
-/** 与次要卡片（第 2、3 张）一致：作者署名行 */
+/** 与次要卡片（第 2、3 张）一致：作者署名行（含内链样式） */
 const sourceAttributionClass =
   'text-[11px] text-[#A5A5A5] italic mt-1 leading-tight';
+
+const attributionLinkClass =
+  'underline decoration-[#A5A5A5]/35 underline-offset-2 hover:text-[#1A1A1A] hover:decoration-[#1A1A1A]/35';
+
+function PhotoAttribution({
+  item,
+  className,
+}: {
+  item: SearchResult;
+  className?: string;
+}) {
+  const brand =
+    item.stock === 'unsplash'
+      ? {
+          label: 'Unsplash',
+          href: 'https://unsplash.com/?utm_source=sugo_gallery&utm_medium=referral',
+        }
+      : {
+          label: 'Pexels',
+          href: 'https://www.pexels.com?utm_source=sugo_gallery&utm_medium=referral',
+        };
+
+  return (
+    <p className={cn(sourceAttributionClass, className)}>
+      Photo by{' '}
+      <a
+        href={item.photographerUrl}
+        target="_blank"
+        rel="noopener noreferrer"
+        className={attributionLinkClass}
+      >
+        {item.source}
+      </a>{' '}
+      on{' '}
+      <a
+        href={brand.href}
+        target="_blank"
+        rel="noopener noreferrer"
+        className={attributionLinkClass}
+      >
+        {brand.label}
+      </a>
+    </p>
+  );
+}
 
 const LIGHTBOX_HISTORY_STATE = { galleryLightbox: true as const };
 
@@ -25,6 +78,8 @@ export default function App() {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [selectedImage, setSelectedImage] = useState<SearchResult | null>(null);
+  const [imageProvider, setImageProvider] =
+    useState<GalleryImageProvider>('mixed');
   /** 已为当前打开的灯箱 push 过一条 history，关闭时应 history.back 与浏览器后退一致 */
   const lightboxHistoryPushedRef = useRef(false);
 
@@ -61,7 +116,9 @@ export default function App() {
     setLoading(true);
     setError(null);
     try {
-      const response = await fetch(`/api/search?q=${encodeURIComponent(searchQuery)}`);
+      const response = await fetch(
+        `/api/search/combined?q=${encodeURIComponent(searchQuery)}`,
+      );
       const data = await response.json();
       if (!response.ok) {
         setError(typeof data.error === 'string' ? data.error : 'Search failed.');
@@ -70,6 +127,13 @@ export default function App() {
       }
       if (Array.isArray(data.results) && data.results.length > 0) {
         setResults(data.results);
+        setImageProvider(
+          data.provider === 'unsplash'
+            ? 'unsplash'
+            : data.provider === 'mixed'
+              ? 'mixed'
+              : 'pexels',
+        );
       } else {
         setError('No results found.');
         setResults([]);
@@ -87,11 +151,25 @@ export default function App() {
     searchImages(query);
   };
 
-  const downloadImage = (url: string, filename: string) => {
+  const downloadAsset = async (item: SearchResult, filename: string) => {
+    if (item.unsplashDownloadLocation) {
+      try {
+        await fetch('/api/unsplash/track-download', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            downloadLocation: item.unsplashDownloadLocation,
+          }),
+        });
+      } catch {
+        /* 仍尝试打开图片链接 */
+      }
+    }
     const link = document.createElement('a');
-    link.href = url;
+    link.href = item.image;
     link.setAttribute('download', filename);
     link.setAttribute('target', '_blank');
+    link.setAttribute('rel', 'noopener noreferrer');
     document.body.appendChild(link);
     link.click();
     document.body.removeChild(link);
@@ -108,7 +186,7 @@ export default function App() {
         {/* Editorial Header */}
         <header className="flex justify-between items-baseline border-b border-[#1A1A1A]/10 pb-6 mb-12">
           <div className="flex flex-col">
-            <span className="text-[10px] uppercase tracking-[0.3em] font-bold text-[#A5A5A5] mb-1">Visual Archive 01</span>
+            <span className="text-[10px] uppercase tracking-[0.3em] font-bold text-[#A5A5A5] mb-1">Landscape Visuals</span>
             <h1 className="text-4xl font-serif italic tracking-tight">Sugo Gallery</h1>
           </div>
           <div className="hidden md:flex gap-8 text-[11px] uppercase tracking-widest font-semibold">
@@ -182,10 +260,12 @@ export default function App() {
                     <p className="text-[10px] uppercase tracking-wider text-[#A5A5A5] mt-2 font-mono">
                       {results[0].width} × {results[0].height} • JPEG
                     </p>
-                    <p className={sourceAttributionClass}>Source: {results[0].source}</p>
+                    <div onClick={(e) => e.stopPropagation()}>
+                      <PhotoAttribution item={results[0]} />
+                    </div>
                   </div>
                   <button 
-                    onClick={(e) => { e.stopPropagation(); downloadImage(results[0].image, 'Sugo-featured.jpg'); }}
+                    onClick={(e) => { e.stopPropagation(); void downloadAsset(results[0], 'Sugo-featured.jpg'); }}
                     className="text-[11px] font-bold underline uppercase tracking-widest hover:text-[#F27D26] transition-colors"
                   >
                     Download Link
@@ -215,7 +295,9 @@ export default function App() {
                       <div>
                         <span className="text-[9px] uppercase tracking-widest font-bold bg-[#1A1A1A] text-white px-2 py-0.5">Asset {idx + 2}</span>
                         <h4 className="font-serif text-lg mt-3 group-hover:italic transition-all">{item.title}</h4>
-                        <p className={cn(sourceAttributionClass, 'line-clamp-2')}>Source: {item.source}</p>
+                        <div onClick={(e) => e.stopPropagation()}>
+                          <PhotoAttribution item={item} className="line-clamp-2" />
+                        </div>
                       </div>
                       <button 
                         onClick={(e) => { e.stopPropagation(); openOrSwitchPreview(item); }}
@@ -248,12 +330,14 @@ export default function App() {
                        />
                      </div>
                      <h5 className="font-serif italic text-sm line-clamp-1">{item.title}</h5>
-                     <p className={cn(sourceAttributionClass, 'line-clamp-2')}>Source: {item.source}</p>
+                     <div onClick={(e) => e.stopPropagation()}>
+                       <PhotoAttribution item={item} className="line-clamp-2" />
+                     </div>
                      <div className="flex justify-between items-center mt-2">
                         <span className="text-[9px] text-[#A5A5A5] font-mono">{item.width}PX</span>
                         <Download 
                           className="w-3 h-3 text-[#A5A5A5] hover:text-[#1A1A1A] cursor-pointer transition-colors"
-                          onClick={(e) => { e.stopPropagation(); downloadImage(item.image, `asset-${idx}.jpg`); }}
+                          onClick={(e) => { e.stopPropagation(); void downloadAsset(item, `asset-${idx}.jpg`); }}
                         />
                      </div>
                    </motion.div>
@@ -276,7 +360,13 @@ export default function App() {
           <div className="flex items-center gap-6">
             <div className="flex items-center gap-2">
               <div className="w-1.5 h-1.5 rounded-full bg-[#00FF00] shadow-[0_0_8px_#00FF00]"></div>
-              <span className="text-[#1A1A1A]">Pexels API</span>
+              <span className="text-[#1A1A1A]">
+                {imageProvider === 'mixed'
+                  ? 'Photos via Pexels & Unsplash'
+                  : imageProvider === 'unsplash'
+                    ? 'Photos via Unsplash'
+                    : 'Photos via Pexels'}
+              </span>
             </div>
             <div className="w-[1px] h-3 bg-[#A5A5A5]/20"></div>
             <span className="hover:text-[#1A1A1A] cursor-pointer transition-colors">Privacy Secured</span>
@@ -321,13 +411,19 @@ export default function App() {
                   </h3>
                   <div className="flex flex-col gap-2 font-mono text-[11px] text-[#A5A5A5]">
                     <p>RES: {selectedImage.width} × {selectedImage.height} PX</p>
-                    <p>SRC: {selectedImage.source.toUpperCase()}</p>
                   </div>
+                  <PhotoAttribution item={selectedImage} className="!mt-0" />
                 </div>
 
                 <div className="flex flex-col gap-4">
                   <button
-                    onClick={() => downloadImage(selectedImage.image, selectedImage.title.slice(0, 20) + '.jpg')}
+                    type="button"
+                    onClick={() =>
+                      void downloadAsset(
+                        selectedImage,
+                        selectedImage.title.slice(0, 20) + '.jpg',
+                      )
+                    }
                     className="w-full py-4 bg-[#1A1A1A] text-white text-[11px] uppercase tracking-[0.25em] font-bold hover:bg-[#333] transition-all flex items-center justify-center gap-3"
                   >
                     <Download className="w-4 h-4" />
@@ -343,8 +439,8 @@ export default function App() {
                   </a>
                 </div>
 
-                <div className="mt-auto opacity-40 text-[9px] uppercase tracking-widest leading-relaxed">
-                   Public access granted via DDG visual search index. All copyrights belong to original publishers.
+                <div className="mt-auto opacity-50 text-[9px] uppercase tracking-widest leading-relaxed">
+                  Images are hotlinked from Pexels or Unsplash per search. Photographer and platform are credited above; use is subject to each provider&apos;s license and API guidelines.
                 </div>
               </div>
             </motion.div>

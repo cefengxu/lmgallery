@@ -4,6 +4,7 @@ import { createServer as createViteServer } from 'vite';
 import axios from 'axios';
 import path from 'path';
 import { fileURLToPath } from 'url';
+import { createApi } from 'unsplash-js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -42,7 +43,7 @@ function collectPexelsApiKeys(): string[] {
   return entries.map((e) => e.key);
 }
 
-/** Advances on each /api/search so keys are used in rotation. */
+/** Advances on each Pexels 请求（/api/search/pexels）以便多 Key 轮流使用。 */
 let pexelsKeyRoundRobin = 0;
 
 function pexelsPerPageFromEnv(): number {
@@ -77,6 +78,59 @@ function scaledDims(
     width: Math.max(1, Math.round(width * scale)),
     height: Math.max(1, Math.round(height * scale)),
   };
+}
+
+/** 单张作品的来源 */
+export type GalleryStock = 'pexels' | 'unsplash';
+
+/** 单次搜索响应层面的来源（合并接口为 mixed） */
+export type GalleryImageProvider = GalleryStock | 'mixed';
+
+/** Unsplash search 单页最多 30 条（官方限制）；与 PEXELS_PER_PAGE 取较小值 */
+const UNSPLASH_SEARCH_PER_PAGE_CAP = 30;
+
+/**
+ * Unsplash `urls` 档位近似长边（用于与 PEXELS_IMAGE_MAX_EDGE 对齐选档）。
+ * 见 https://unsplash.com/documentation#dynamically-resizable-images
+ */
+function pickUnsplashMainImage(
+  photo: {
+    width: number;
+    height: number;
+    urls: { raw: string; full: string; regular: string; small: string; thumb: string };
+  },
+  maxEdgeLimit: number,
+): { url: string; width: number; height: number } {
+  const w = photo.width;
+  const h = photo.height;
+  const longEdge = Math.max(w, h, 1);
+  const u = photo.urls;
+
+  const noLimit =
+    maxEdgeLimit === Number.POSITIVE_INFINITY ||
+    maxEdgeLimit <= 0 ||
+    !Number.isFinite(maxEdgeLimit);
+
+  const fitLimited = [
+    { url: u.raw, nominal: longEdge },
+    { url: u.full, nominal: 2400 },
+    { url: u.regular, nominal: 1080 },
+    { url: u.small, nominal: 400 },
+    { url: u.thumb, nominal: 200 },
+  ] as const;
+
+  if (noLimit) {
+    return { url: u.regular, ...scaledDims(w, h, 1080) };
+  }
+
+  for (const { url, nominal } of fitLimited) {
+    if (!url) continue;
+    if (nominal <= maxEdgeLimit) {
+      return { url, ...scaledDims(w, h, nominal) };
+    }
+  }
+
+  return { url: u.thumb, ...scaledDims(w, h, 200) };
 }
 
 /**
@@ -143,15 +197,22 @@ function pickPexelsMainImage(
   return { url: fallback, width: w, height: h };
 }
 
-/** 与 UI / GET /api/search 共用：单张检索结果（image 为可直接下载的主图 CDN URL）。 */
+/** 与 UI / GET /api/search/pexels 共用：单张检索结果（image 为可直接下载的主图 CDN URL，须 hotlink）。 */
 export type GallerySearchResultItem = {
   title: string;
   image: string;
   thumbnail: string;
+  /** 作品在图库网站的页面（Unsplash / Pexels） */
   url: string;
   height: number;
   width: number;
+  /** 摄影师显示名 */
   source: string;
+  stock: GalleryStock;
+  /** 摄影师个人页，用于「Photo by … on …」署名链到作者 */
+  photographerUrl: string;
+  /** 仅 Unsplash：须在用户下载时由服务端请求 trackDownload */
+  unsplashDownloadLocation?: string;
 };
 
 type PexelsPhotosResponse = {
@@ -161,22 +222,102 @@ type PexelsPhotosResponse = {
     height: number;
     url: string;
     photographer: string;
+    photographer_url?: string;
     alt?: string;
     src: Record<string, string>;
   }>;
 };
 
-type SearchOk = { ok: true; query: string; results: GallerySearchResultItem[] };
+type SearchOk = {
+  ok: true;
+  query: string;
+  results: GallerySearchResultItem[];
+  provider: GalleryImageProvider;
+  /** 仅合并搜索：本次分配的条数与比例模式 */
+  mix?: {
+    splitMode: '5:5' | '4:6';
+    requestedPexels: number;
+    requestedUnsplash: number;
+  };
+};
 type SearchErr = {
   ok: false;
   status: number;
   body: { error: string };
 };
 
+function shuffleInPlace<T>(arr: T[]): void {
+  for (let i = arr.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [arr[i], arr[j]] = [arr[j], arr[i]];
+  }
+}
+
 /**
- * 执行一次与前端检索相同的 Pexels 查询（per_page、orientation、主图档位等与 GET /api/search 一致）。
+ * 按总条数（PEXELS_PER_PAGE）随机选 5:5 或 4:6，并确保两端至少各 1 张（total≥2）。
+ * Unsplash 请求条数不超过 UNSPLASH_SEARCH_PER_PAGE_CAP，超出部分划归 Pexels。
  */
-async function runGalleryImageSearch(query: string): Promise<SearchOk | SearchErr> {
+function computeMixedSplit(total: number): {
+  nPexels: number;
+  nUnsplash: number;
+  splitMode: '5:5' | '4:6';
+} {
+  const t = Math.min(80, Math.max(1, total));
+  if (t <= 1) {
+    const firstPexels = Math.random() < 0.5;
+    return {
+      nPexels: firstPexels ? 1 : 0,
+      nUnsplash: firstPexels ? 0 : 1,
+      splitMode: '5:5',
+    };
+  }
+
+  const useEven = Math.random() < 0.5;
+  let splitMode: '5:5' | '4:6';
+  let nP: number;
+  let nU: number;
+
+  if (useEven) {
+    splitMode = '5:5';
+    nP = Math.ceil(t / 2);
+    nU = t - nP;
+  } else {
+    splitMode = '4:6';
+    const small = Math.max(1, Math.floor(t * 0.4));
+    const large = t - small;
+    if (Math.random() < 0.5) {
+      nP = small;
+      nU = large;
+    } else {
+      nP = large;
+      nU = small;
+    }
+  }
+
+  if (nP === 0) {
+    nP = 1;
+    nU = t - 1;
+  }
+  if (nU === 0) {
+    nU = 1;
+    nP = t - 1;
+  }
+
+  if (nU > UNSPLASH_SEARCH_PER_PAGE_CAP) {
+    const overflow = nU - UNSPLASH_SEARCH_PER_PAGE_CAP;
+    nU = UNSPLASH_SEARCH_PER_PAGE_CAP;
+    nP = Math.min(80, nP + overflow);
+  }
+  if (nP > 80) {
+    const overflow = nP - 80;
+    nP = 80;
+    nU = Math.min(UNSPLASH_SEARCH_PER_PAGE_CAP, nU + overflow);
+  }
+
+  return { nPexels: nP, nUnsplash: nU, splitMode };
+}
+
+async function runCombinedGallerySearch(query: string): Promise<SearchOk | SearchErr> {
   const trimmed = query.trim();
   if (!trimmed) {
     return {
@@ -185,6 +326,93 @@ async function runGalleryImageSearch(query: string): Promise<SearchOk | SearchEr
       body: { error: 'Missing search keyword (use q or keyword).' },
     };
   }
+
+  const { nPexels, nUnsplash, splitMode } = computeMixedSplit(PEXELS_PER_PAGE);
+
+  const pexelsP: Promise<SearchOk | SearchErr | null> =
+    nPexels > 0
+      ? runPexelsGallerySearch(trimmed, { perPage: nPexels })
+      : Promise.resolve(null);
+  const unsplashP: Promise<SearchOk | SearchErr | null> =
+    nUnsplash > 0
+      ? runUnsplashGallerySearch(trimmed, { perPage: nUnsplash })
+      : Promise.resolve(null);
+
+  const [pexelsOut, unsplashOut] = await Promise.all([pexelsP, unsplashP]);
+
+  const merged: GallerySearchResultItem[] = [];
+  let pexelsErr: SearchErr | null = null;
+  let unsplashErr: SearchErr | null = null;
+
+  if (pexelsOut !== null) {
+    if (pexelsOut.ok === true) merged.push(...pexelsOut.results);
+    else pexelsErr = pexelsOut;
+  }
+  if (unsplashOut !== null) {
+    if (unsplashOut.ok === true) merged.push(...unsplashOut.results);
+    else unsplashErr = unsplashOut;
+  }
+
+  shuffleInPlace(merged);
+
+  if (merged.length === 0) {
+    const fallback = pexelsErr ?? unsplashErr;
+    if (fallback !== null) return fallback;
+    return {
+      ok: false,
+      status: 500,
+      body: { error: 'No images returned from Pexels or Unsplash.' },
+    };
+  }
+
+  const onlyPexels =
+    merged.length > 0 && merged.every((r) => r.stock === 'pexels');
+  const onlyUnsplash =
+    merged.length > 0 && merged.every((r) => r.stock === 'unsplash');
+  const provider: GalleryImageProvider = onlyPexels
+    ? 'pexels'
+    : onlyUnsplash
+      ? 'unsplash'
+      : 'mixed';
+
+  return {
+    ok: true,
+    query: trimmed,
+    results: merged,
+    provider,
+    mix:
+      provider === 'mixed'
+        ? {
+            splitMode,
+            requestedPexels: nPexels,
+            requestedUnsplash: nUnsplash,
+          }
+        : undefined,
+  };
+}
+
+type PerProviderSearchOpts = { perPage?: number };
+
+/**
+ * 执行一次与前端检索相同的 Pexels 查询（per_page、orientation、主图档位等与 GET /api/search/pexels 一致）。
+ */
+async function runPexelsGallerySearch(
+  query: string,
+  opts?: PerProviderSearchOpts,
+): Promise<SearchOk | SearchErr> {
+  const trimmed = query.trim();
+  if (!trimmed) {
+    return {
+      ok: false,
+      status: 400,
+      body: { error: 'Missing search keyword (use q or keyword).' },
+    };
+  }
+
+  const perPage = Math.min(
+    80,
+    Math.max(1, opts?.perPage ?? PEXELS_PER_PAGE),
+  );
 
   const keys = collectPexelsApiKeys();
   if (keys.length === 0) {
@@ -210,7 +438,7 @@ async function runGalleryImageSearch(query: string): Promise<SearchOk | SearchEr
       const { data } = await axios.get<PexelsPhotosResponse>(PEXELS_SEARCH, {
         params: {
           query: trimmed,
-          per_page: PEXELS_PER_PAGE,
+          per_page: perPage,
           page: 1,
           orientation: 'landscape',
         },
@@ -232,11 +460,15 @@ async function runGalleryImageSearch(query: string): Promise<SearchOk | SearchEr
           url: photo.url,
           height: main.height,
           width: main.width,
-          source: photo.photographer || 'Pexels',
+          source: photo.photographer || 'Photographer',
+          stock: 'pexels',
+          photographerUrl:
+            (photo.photographer_url && photo.photographer_url.trim()) ||
+            photo.url,
         };
       });
 
-      return { ok: true, query: trimmed, results };
+      return { ok: true, query: trimmed, results, provider: 'pexels' };
     } catch (error: unknown) {
       const err = error as {
         message?: string;
@@ -280,12 +512,121 @@ async function runGalleryImageSearch(query: string): Promise<SearchOk | SearchEr
   };
 }
 
+/**
+ * 使用官方 unsplash-js（search.getPhotos）拉取图片；结果字段与 Pexels 路径一致。
+ * Access Key：https://unsplash.com/oauth/applications
+ */
+async function runUnsplashGallerySearch(
+  query: string,
+  opts?: PerProviderSearchOpts,
+): Promise<SearchOk | SearchErr> {
+  const trimmed = query.trim();
+  if (!trimmed) {
+    return {
+      ok: false,
+      status: 400,
+      body: { error: 'Missing search keyword (use q or keyword).' },
+    };
+  }
+
+  const accessKey = process.env.UNSPLASH_ACCESS_KEY?.trim();
+  if (!accessKey) {
+    return {
+      ok: false,
+      status: 500,
+      body: {
+        error:
+          'UNSPLASH_ACCESS_KEY is not set. Create an app at https://unsplash.com/oauth/applications',
+      },
+    };
+  }
+
+  const unsplash = createApi({ accessKey });
+  const imageMaxEdge = pexelsImageMaxEdgeFromEnv();
+  const perPage = Math.min(
+    UNSPLASH_SEARCH_PER_PAGE_CAP,
+    Math.max(1, opts?.perPage ?? PEXELS_PER_PAGE),
+  );
+
+  try {
+    const result = await unsplash.search.getPhotos(
+      {
+        query: trimmed,
+        page: 1,
+        perPage,
+        orientation: 'landscape',
+      },
+      { signal: AbortSignal.timeout(30_000) },
+    );
+
+    if (result.type === 'error') {
+      const msg = result.errors[0] ?? 'Unsplash search failed';
+      const status =
+        result.status === 401 || result.status === 403 ? 401 : 500;
+      return { ok: false, status, body: { error: msg } };
+    }
+
+    const photos = result.response.results;
+    const results: GallerySearchResultItem[] = photos.map((photo) => {
+      const main = pickUnsplashMainImage(photo, imageMaxEdge);
+      const title =
+        (photo.alt_description && photo.alt_description.trim()) ||
+        (photo.description && photo.description.trim()) ||
+        `Photo by ${photo.user.name}`;
+      return {
+        title,
+        image: main.url,
+        thumbnail: photo.urls.thumb || photo.urls.small,
+        url: photo.links.html,
+        height: main.height,
+        width: main.width,
+        source: photo.user.name || 'Photographer',
+        stock: 'unsplash',
+        photographerUrl: photo.user.links.html,
+        unsplashDownloadLocation: photo.links.download_location,
+      };
+    });
+
+    return { ok: true, query: trimmed, results, provider: 'unsplash' };
+  } catch (e: unknown) {
+    const err = e as { name?: string; message?: string };
+    if (err.name === 'TimeoutError' || err.name === 'AbortError') {
+      return {
+        ok: false,
+        status: 504,
+        body: { error: 'Unsplash request timed out.' },
+      };
+    }
+    console.error('Unsplash search error:', err.message);
+    return {
+      ok: false,
+      status: 500,
+      body: { error: 'Failed to fetch images from Unsplash.' },
+    };
+  }
+}
+
+function parseSearchKeywordBody(
+  body: { q?: unknown; keyword?: unknown } | undefined,
+): string {
+  if (typeof body?.q === 'string') return body.q;
+  if (typeof body?.keyword === 'string') return body.keyword;
+  return '';
+}
+
 /** GET/POST 共用响应：results 项与前端 SearchResult 一致；image 为主图 CDN 直链（可与 UI 下载行为一致）。 */
-function jsonSearchPayload(query: string, results: GallerySearchResultItem[]) {
+function jsonSearchPayload(
+  query: string,
+  results: GallerySearchResultItem[],
+  provider: GalleryImageProvider,
+  mix?: SearchOk['mix'],
+) {
   return {
     query,
     count: results.length,
     results,
+    provider,
+    ...(mix ? { mix } : {}),
   };
 }
 
@@ -296,31 +637,122 @@ async function startServer() {
 
   app.use(express.json());
 
-  app.get('/api/search', async (req, res) => {
+  /** Pexels：GET/POST /api/search/pexels，仅查询 Pexels */
+  app.get('/api/search/pexels', async (req, res) => {
     const query = (req.query.q as string)?.trim();
     if (!query) {
       return res.status(400).json({ error: 'Missing query parameter q' });
     }
-    const out = await runGalleryImageSearch(query);
-    if (!out.ok) {
+    const out = await runPexelsGallerySearch(query);
+    if (out.ok === false) {
       return res.status(out.status).json(out.body);
     }
-    return res.json(jsonSearchPayload(out.query, out.results));
+    return res.json(
+      jsonSearchPayload(out.query, out.results, out.provider, out.mix),
+    );
   });
 
-  app.post('/api/search', async (req, res) => {
-    const body = req.body as { q?: unknown; keyword?: unknown } | undefined;
-    const qRaw =
-      typeof body?.q === 'string'
-        ? body.q
-        : typeof body?.keyword === 'string'
-          ? body.keyword
-          : '';
-    const out = await runGalleryImageSearch(qRaw);
-    if (!out.ok) {
+  app.post('/api/search/pexels', async (req, res) => {
+    const qRaw = parseSearchKeywordBody(
+      req.body as { q?: unknown; keyword?: unknown } | undefined,
+    );
+    const out = await runPexelsGallerySearch(qRaw);
+    if (out.ok === false) {
       return res.status(out.status).json(out.body);
     }
-    return res.json(jsonSearchPayload(out.query, out.results));
+    return res.json(
+      jsonSearchPayload(out.query, out.results, out.provider, out.mix),
+    );
+  });
+
+  /** 合并：并行请求 Pexels + Unsplash，条数按随机 5:5 或 4:6 分配（总数来自 PEXELS_PER_PAGE），结果打乱混合 */
+  app.get('/api/search/combined', async (req, res) => {
+    const query = (req.query.q as string)?.trim();
+    if (!query) {
+      return res.status(400).json({ error: 'Missing query parameter q' });
+    }
+    const out = await runCombinedGallerySearch(query);
+    if (out.ok === false) {
+      return res.status(out.status).json(out.body);
+    }
+    return res.json(
+      jsonSearchPayload(out.query, out.results, out.provider, out.mix),
+    );
+  });
+
+  app.post('/api/search/combined', async (req, res) => {
+    const qRaw = parseSearchKeywordBody(
+      req.body as { q?: unknown; keyword?: unknown } | undefined,
+    );
+    const out = await runCombinedGallerySearch(qRaw);
+    if (out.ok === false) {
+      return res.status(out.status).json(out.body);
+    }
+    return res.json(
+      jsonSearchPayload(out.query, out.results, out.provider, out.mix),
+    );
+  });
+
+  /** Unsplash：GET/POST 与 /api/search/pexels 参数形态一致，仅数据源为 Unsplash */
+  app.get('/api/search/unsplash', async (req, res) => {
+    const query = (req.query.q as string)?.trim();
+    if (!query) {
+      return res.status(400).json({ error: 'Missing query parameter q' });
+    }
+    const out = await runUnsplashGallerySearch(query);
+    if (out.ok === false) {
+      return res.status(out.status).json(out.body);
+    }
+    return res.json(
+      jsonSearchPayload(out.query, out.results, out.provider, out.mix),
+    );
+  });
+
+  app.post('/api/search/unsplash', async (req, res) => {
+    const qRaw = parseSearchKeywordBody(
+      req.body as { q?: unknown; keyword?: unknown } | undefined,
+    );
+    const out = await runUnsplashGallerySearch(qRaw);
+    if (out.ok === false) {
+      return res.status(out.status).json(out.body);
+    }
+    return res.json(
+      jsonSearchPayload(out.query, out.results, out.provider, out.mix),
+    );
+  });
+
+  /**
+   * Unsplash：用户实际下载／使用图片时触发（对应 unsplash-js photos.trackDownload）。
+   * Body: { "downloadLocation": "<photo.links.download_location>" }
+   */
+  app.post('/api/unsplash/track-download', async (req, res) => {
+    const raw = (req.body as { downloadLocation?: unknown } | undefined)
+      ?.downloadLocation;
+    const downloadLocation =
+      typeof raw === 'string' ? raw.trim() : '';
+    if (!downloadLocation) {
+      return res.status(400).json({ error: 'Missing downloadLocation' });
+    }
+    const accessKey = process.env.UNSPLASH_ACCESS_KEY?.trim();
+    if (!accessKey) {
+      return res.status(500).json({ error: 'Unsplash is not configured.' });
+    }
+    const unsplash = createApi({ accessKey });
+    try {
+      const result = await unsplash.photos.trackDownload(
+        { downloadLocation },
+        { signal: AbortSignal.timeout(15_000) },
+      );
+      if (result.type === 'error') {
+        const msg = result.errors[0] ?? 'Unsplash trackDownload failed';
+        return res.status(502).json({ error: msg });
+      }
+      return res.status(204).send();
+    } catch (e: unknown) {
+      const err = e as { message?: string };
+      console.error('[unsplash] trackDownload:', err.message);
+      return res.status(502).json({ error: 'Unsplash trackDownload failed.' });
+    }
   });
 
   // Vite middleware for development
