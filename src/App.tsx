@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef, useCallback } from 'react';
 import { Search, Download, ExternalLink, Image as ImageIcon, Loader2, Compass, MapPin, X } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
 import { cn } from './lib/utils';
@@ -13,12 +13,48 @@ interface SearchResult {
   source: string;
 }
 
+/** 与次要卡片（第 2、3 张）一致：作者署名行 */
+const sourceAttributionClass =
+  'text-[11px] text-[#A5A5A5] italic mt-1 leading-tight';
+
+const LIGHTBOX_HISTORY_STATE = { galleryLightbox: true as const };
+
 export default function App() {
   const [query, setQuery] = useState('');
   const [results, setResults] = useState<SearchResult[]>([]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [selectedImage, setSelectedImage] = useState<SearchResult | null>(null);
+  /** 已为当前打开的灯箱 push 过一条 history，关闭时应 history.back 与浏览器后退一致 */
+  const lightboxHistoryPushedRef = useRef(false);
+
+  const closeLightbox = useCallback(() => {
+    if (lightboxHistoryPushedRef.current) {
+      window.history.back();
+      return;
+    }
+    setSelectedImage(null);
+  }, []);
+
+  /** 仅在「从关闭到打开」时压入 history，换图不重复 push；与浏览器后退、关闭按钮共用一条栈记录 */
+  const openOrSwitchPreview = useCallback((item: SearchResult) => {
+    setSelectedImage((prev) => {
+      if (prev == null) {
+        window.history.pushState(LIGHTBOX_HISTORY_STATE, '');
+        lightboxHistoryPushedRef.current = true;
+      }
+      return item;
+    });
+  }, []);
+
+  useEffect(() => {
+    const onPopState = () => {
+      lightboxHistoryPushedRef.current = false;
+      setSelectedImage(null);
+    };
+    window.addEventListener('popstate', onPopState);
+    return () => window.removeEventListener('popstate', onPopState);
+  }, []);
 
   const searchImages = async (searchQuery: string) => {
     if (!searchQuery.trim()) return;
@@ -133,7 +169,7 @@ export default function App() {
                 initial={{ opacity: 0, y: 30 }}
                 animate={{ opacity: 1, y: 0 }}
                 className="col-span-1 md:col-span-7 h-[400px] md:h-[600px] relative group cursor-pointer overflow-hidden bg-[#EAE8E4]"
-                onClick={() => setSelectedImage(results[0])}
+                onClick={() => openOrSwitchPreview(results[0])}
               >
                 <img 
                   src={results[0].image} 
@@ -144,8 +180,9 @@ export default function App() {
                   <div className="max-w-[70%]">
                     <h3 className="font-serif text-2xl italic line-clamp-1">{results[0].title}</h3>
                     <p className="text-[10px] uppercase tracking-wider text-[#A5A5A5] mt-2 font-mono">
-                      {results[0].width} × {results[0].height} • JPEG • FROM {results[0].source.toUpperCase()}
+                      {results[0].width} × {results[0].height} • JPEG
                     </p>
+                    <p className={sourceAttributionClass}>Source: {results[0].source}</p>
                   </div>
                   <button 
                     onClick={(e) => { e.stopPropagation(); downloadImage(results[0].image, 'Sugo-featured.jpg'); }}
@@ -165,7 +202,7 @@ export default function App() {
                     animate={{ opacity: 1, x: 0 }}
                     transition={{ delay: 0.1 * idx }}
                     className="flex-grow flex gap-6 pb-8 border-b border-[#1A1A1A]/10 group cursor-pointer"
-                    onClick={() => setSelectedImage(item)}
+                    onClick={() => openOrSwitchPreview(item)}
                   >
                     <div className="w-1/3 aspect-square bg-[#EAE8E4] overflow-hidden">
                       <img 
@@ -178,10 +215,10 @@ export default function App() {
                       <div>
                         <span className="text-[9px] uppercase tracking-widest font-bold bg-[#1A1A1A] text-white px-2 py-0.5">Asset {idx + 2}</span>
                         <h4 className="font-serif text-lg mt-3 group-hover:italic transition-all">{item.title}</h4>
-                        <p className="text-[11px] text-[#A5A5A5] italic mt-1 leading-tight line-clamp-2">Source: {item.source}</p>
+                        <p className={cn(sourceAttributionClass, 'line-clamp-2')}>Source: {item.source}</p>
                       </div>
                       <button 
-                        onClick={(e) => { e.stopPropagation(); setSelectedImage(item); }}
+                        onClick={(e) => { e.stopPropagation(); openOrSwitchPreview(item); }}
                         className="w-fit text-[10px] uppercase font-bold border border-[#1A1A1A] px-4 py-2 hover:bg-[#1A1A1A] hover:text-white transition-all mt-4"
                       >
                         Get Asset
@@ -200,7 +237,7 @@ export default function App() {
                     animate={{ opacity: 1, y: 0 }}
                     transition={{ delay: 0.05 * idx }}
                     className="group cursor-pointer"
-                    onClick={() => setSelectedImage(item)}
+                    onClick={() => openOrSwitchPreview(item)}
                    >
                      <div className="aspect-[4/5] bg-[#EAE8E4] overflow-hidden mb-4 rounded-sm">
                        <img 
@@ -211,6 +248,7 @@ export default function App() {
                        />
                      </div>
                      <h5 className="font-serif italic text-sm line-clamp-1">{item.title}</h5>
+                     <p className={cn(sourceAttributionClass, 'line-clamp-2')}>Source: {item.source}</p>
                      <div className="flex justify-between items-center mt-2">
                         <span className="text-[9px] text-[#A5A5A5] font-mono">{item.width}PX</span>
                         <Download 
@@ -256,7 +294,8 @@ export default function App() {
             className="fixed inset-0 z-50 bg-[#FDFCFB]/98 backdrop-blur-md flex items-center justify-center p-6 md:p-20"
           >
             <button
-              onClick={() => setSelectedImage(null)}
+              type="button"
+              onClick={closeLightbox}
               className="absolute top-12 right-12 text-[#1A1A1A] hover:opacity-50 transition-all"
             >
               <X className="w-10 h-10 stroke-[1.5]" />
