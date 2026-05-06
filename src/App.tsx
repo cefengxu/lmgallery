@@ -1,7 +1,14 @@
 import React, { useState, useEffect, useRef, useCallback } from 'react';
-import { Search, Download, ExternalLink, Image as ImageIcon, Loader2, Compass, MapPin, X } from 'lucide-react';
+import { Download, X } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
 import { cn } from './lib/utils';
+import { DocumentationContent } from './Documentation';
+
+function isDocumentationHash(): boolean {
+  if (typeof window === 'undefined') return false;
+  const raw = window.location.hash.replace(/^#/, '').replace(/^\//, '').toLowerCase();
+  return raw === 'documentation' || raw === 'docs';
+}
 
 type GalleryStock = 'pexels' | 'unsplash';
 
@@ -73,6 +80,9 @@ function PhotoAttribution({
 const LIGHTBOX_HISTORY_STATE = { galleryLightbox: true as const };
 
 export default function App() {
+  const [page, setPage] = useState<'home' | 'documentation'>(() =>
+    typeof window !== 'undefined' && isDocumentationHash() ? 'documentation' : 'home',
+  );
   const [query, setQuery] = useState('');
   const [results, setResults] = useState<SearchResult[]>([]);
   const [loading, setLoading] = useState(false);
@@ -109,6 +119,32 @@ export default function App() {
     };
     window.addEventListener('popstate', onPopState);
     return () => window.removeEventListener('popstate', onPopState);
+  }, []);
+
+  useEffect(() => {
+    const syncPageFromHash = () => {
+      setPage(isDocumentationHash() ? 'documentation' : 'home');
+    };
+    syncPageFromHash();
+    window.addEventListener('hashchange', syncPageFromHash);
+    return () => window.removeEventListener('hashchange', syncPageFromHash);
+  }, []);
+
+  useEffect(() => {
+    if (page !== 'documentation') return;
+    lightboxHistoryPushedRef.current = false;
+    setSelectedImage(null);
+  }, [page]);
+
+  const openHome = useCallback(() => {
+    if (window.location.hash) {
+      window.location.hash = '';
+    }
+    setPage('home');
+  }, []);
+
+  const openDocumentation = useCallback(() => {
+    window.location.hash = '#/documentation';
   }, []);
 
   const searchImages = async (searchQuery: string) => {
@@ -176,6 +212,7 @@ export default function App() {
   };
 
   useEffect(() => {
+    if (isDocumentationHash()) return;
     searchImages('Switzerland Alps landscape');
   }, []);
 
@@ -184,19 +221,53 @@ export default function App() {
       <div className="max-w-[1440px] mx-auto flex flex-col min-h-screen">
         
         {/* Editorial Header */}
-        <header className="flex justify-between items-baseline border-b border-[#1A1A1A]/10 pb-6 mb-12">
-          <div className="flex flex-col">
-            <span className="text-[10px] uppercase tracking-[0.3em] font-bold text-[#A5A5A5] mb-1">Landscape Visuals</span>
-            <h1 className="text-4xl font-serif italic tracking-tight">Sugo Gallery</h1>
-          </div>
-          <div className="hidden md:flex gap-8 text-[11px] uppercase tracking-widest font-semibold">
-            <span className="border-b border-[#1A1A1A] cursor-pointer">Discovery</span>
-            <span className="text-[#A5A5A5] hover:text-[#1A1A1A] transition-colors cursor-pointer">Archive</span>
-            <span className="text-[#A5A5A5] hover:text-[#1A1A1A] transition-colors cursor-pointer">Documentation</span>
-          </div>
+        <header className="flex flex-col gap-6 sm:flex-row sm:justify-between sm:items-baseline border-b border-[#1A1A1A]/10 pb-6 mb-12">
+          <button
+            type="button"
+            onClick={openHome}
+            className="flex flex-col text-left outline-none focus-visible:ring-2 focus-visible:ring-[#F27D26]/40 focus-visible:ring-offset-2 focus-visible:ring-offset-[#FDFCFB] rounded-sm"
+          >
+            <span className="text-[10px] uppercase tracking-[0.3em] font-bold text-[#A5A5A5] mb-1">
+              Landscape Visuals
+            </span>
+            <span className="text-4xl font-serif italic tracking-tight text-[#1A1A1A]">Sugo Gallery</span>
+          </button>
+          <nav
+            className="flex flex-wrap gap-x-6 gap-y-2 text-[10px] sm:text-[11px] uppercase tracking-widest font-semibold"
+            aria-label="Primary"
+          >
+            <button
+              type="button"
+              onClick={openHome}
+              className={cn(
+                'transition-colors border-b pb-0.5',
+                page === 'home'
+                  ? 'border-[#1A1A1A] text-[#1A1A1A]'
+                  : 'border-transparent text-[#A5A5A5] hover:text-[#1A1A1A]',
+              )}
+            >
+              Discovery
+            </button>
+            <span className="text-[#A5A5A5]/60 cursor-not-allowed border-b border-transparent pb-0.5">
+              Archive
+            </span>
+            <button
+              type="button"
+              onClick={openDocumentation}
+              className={cn(
+                'transition-colors border-b pb-0.5',
+                page === 'documentation'
+                  ? 'border-[#1A1A1A] text-[#1A1A1A]'
+                  : 'border-transparent text-[#A5A5A5] hover:text-[#1A1A1A]',
+              )}
+            >
+              Documentation
+            </button>
+          </nav>
         </header>
 
         {/* Main Search Area */}
+        {page === 'home' && (
         <div className="flex flex-col items-center mb-16 px-4">
           <form onSubmit={handleSearch} className="w-full max-w-2xl relative">
             <span className="absolute -top-7 left-0 text-[10px] uppercase font-bold tracking-tighter opacity-40 italic">
@@ -220,10 +291,13 @@ export default function App() {
             </div>
           </form>
         </div>
+        )}
 
         {/* Editorial Content Layout */}
         <main className="flex-grow">
-          {loading ? (
+          {page === 'documentation' ? (
+            <DocumentationContent />
+          ) : loading ? (
             <div className="h-64 flex items-center justify-center">
               <div className="text-[10px] uppercase tracking-[0.4em] font-bold animate-pulse text-[#A5A5A5]">
                 Scanning Global Assets...
@@ -355,7 +429,9 @@ export default function App() {
         <footer className="mt-20 pt-8 border-t border-[#1A1A1A]/10 flex flex-col md:flex-row justify-between items-center text-[10px] font-bold uppercase tracking-[0.2em] pb-12 text-[#A5A5A5]">
           <div className="flex gap-8 mb-6 md:mb-0">
             <span className="text-[#1A1A1A]">Session ID: ARCH-{Date.now().toString().slice(-4)}</span>
-            <div className="hidden sm:block">Assets in current view: {results.length}</div>
+            {page === 'home' && (
+              <div className="hidden sm:block">Assets in current view: {results.length}</div>
+            )}
           </div>
           <div className="flex items-center gap-6">
             <div className="flex items-center gap-2">
