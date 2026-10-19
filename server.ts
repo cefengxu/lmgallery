@@ -46,13 +46,31 @@ function collectPexelsApiKeys(): string[] {
 /** Advances on each Pexels 请求（/api/search/pexels）以便多 Key 轮流使用。 */
 let pexelsKeyRoundRobin = 0;
 
-function pexelsPerPageFromEnv(): number {
-  const parsed = parseInt(process.env.PEXELS_PER_PAGE ?? '3', 10);
-  if (!Number.isFinite(parsed)) return 3;
-  return Math.min(80, Math.max(1, parsed));
+/** Parse SEARCH_*_PER_PAGE: invalid/empty → default; clamp to [1, max]. */
+function searchPerPageFromEnv(
+  name: string,
+  opts: { defaultValue: number; max: number },
+): number {
+  const parsed = parseInt(process.env[name] ?? String(opts.defaultValue), 10);
+  if (!Number.isFinite(parsed)) return opts.defaultValue;
+  return Math.min(opts.max, Math.max(1, parsed));
 }
 
-const PEXELS_PER_PAGE = pexelsPerPageFromEnv();
+/** /api/search/pexels only (1–80). */
+const SEARCH_PEXELS_PER_PAGE = searchPerPageFromEnv('SEARCH_PEXELS_PER_PAGE', {
+  defaultValue: 3,
+  max: 80,
+});
+/** /api/search/unsplash only (1–30). */
+const SEARCH_UNSPLASH_PER_PAGE = searchPerPageFromEnv(
+  'SEARCH_UNSPLASH_PER_PAGE',
+  { defaultValue: 3, max: 30 },
+);
+/** /api/search/combined total before 5:5 / 4:6 split (1–80). */
+const SEARCH_COMBINED_PER_PAGE = searchPerPageFromEnv(
+  'SEARCH_COMBINED_PER_PAGE',
+  { defaultValue: 3, max: 80 },
+);
 
 /**
  * 下载/展示主图的最长边上限（像素）。不设或空 = 不强制压缩档位，优先 large2x → large → original。
@@ -86,7 +104,7 @@ export type GalleryStock = 'pexels' | 'unsplash';
 /** 单次搜索响应层面的来源（合并接口为 mixed） */
 export type GalleryImageProvider = GalleryStock | 'mixed';
 
-/** Unsplash search 单页最多 30 条（官方限制）；与 PEXELS_PER_PAGE 取较小值 */
+/** Unsplash search 单页最多 30 条（官方限制）。 */
 const UNSPLASH_SEARCH_PER_PAGE_CAP = 30;
 
 /**
@@ -254,7 +272,7 @@ function shuffleInPlace<T>(arr: T[]): void {
 }
 
 /**
- * 按总条数（PEXELS_PER_PAGE）随机选 5:5 或 4:6，并确保两端至少各 1 张（total≥2）。
+ * 按总条数（SEARCH_COMBINED_PER_PAGE）随机选 5:5 或 4:6，并确保两端至少各 1 张（total≥2）。
  * Unsplash 请求条数不超过 UNSPLASH_SEARCH_PER_PAGE_CAP，超出部分划归 Pexels。
  */
 function computeMixedSplit(total: number): {
@@ -327,7 +345,9 @@ async function runCombinedGallerySearch(query: string): Promise<SearchOk | Searc
     };
   }
 
-  const { nPexels, nUnsplash, splitMode } = computeMixedSplit(PEXELS_PER_PAGE);
+  const { nPexels, nUnsplash, splitMode } = computeMixedSplit(
+    SEARCH_COMBINED_PER_PAGE,
+  );
 
   const pexelsP: Promise<SearchOk | SearchErr | null> =
     nPexels > 0
@@ -411,7 +431,7 @@ async function runPexelsGallerySearch(
 
   const perPage = Math.min(
     80,
-    Math.max(1, opts?.perPage ?? PEXELS_PER_PAGE),
+    Math.max(1, opts?.perPage ?? SEARCH_PEXELS_PER_PAGE),
   );
 
   const keys = collectPexelsApiKeys();
@@ -545,7 +565,7 @@ async function runUnsplashGallerySearch(
   const imageMaxEdge = pexelsImageMaxEdgeFromEnv();
   const perPage = Math.min(
     UNSPLASH_SEARCH_PER_PAGE_CAP,
-    Math.max(1, opts?.perPage ?? PEXELS_PER_PAGE),
+    Math.max(1, opts?.perPage ?? SEARCH_UNSPLASH_PER_PAGE),
   );
 
   try {
@@ -665,7 +685,7 @@ async function startServer() {
     );
   });
 
-  /** 合并：并行请求 Pexels + Unsplash，条数按随机 5:5 或 4:6 分配（总数来自 PEXELS_PER_PAGE），结果打乱混合 */
+  /** 合并：并行请求 Pexels + Unsplash，条数按随机 5:5 或 4:6 分配（总数来自 SEARCH_COMBINED_PER_PAGE），结果打乱混合 */
   app.get('/api/search/combined', async (req, res) => {
     const query = (req.query.q as string)?.trim();
     if (!query) {
