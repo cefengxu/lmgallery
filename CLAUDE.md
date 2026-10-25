@@ -8,10 +8,15 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 npm install          # Install dependencies
 npm run dev          # Start Express + Vite (tsx server.ts) on PORT (default 3738)
 npm run build        # Production build → dist/
+npm run start        # Production: Express serves dist/ (NODE_ENV=production)
 npm run preview      # Serve production build via Vite only (not Express)
 npm run lint         # TypeScript type-check (tsc --noEmit)
 npm run clean        # Remove dist/
+npm run pm2:start    # PM2: pm2 start ecosystem.config.cjs (after build + .env)
+npm run pm2:reload   # PM2: pm2 reload lmgallery
 ```
+
+Production with PM2: `npm run build` then `pm2 start ecosystem.config.cjs` (or `npm run pm2:start`). Requires PM2 installed globally (or on PATH). Logs go to `logs/`.
 
 No test framework is configured.
 
