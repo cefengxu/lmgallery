@@ -4,13 +4,29 @@ import { motion, AnimatePresence } from 'motion/react';
 import { cn } from './lib/utils';
 import { DocumentationContent } from './Documentation';
 
+function hashRouteSegment(): string {
+  if (typeof window === 'undefined') return '';
+  return window.location.hash.replace(/^#/, '').replace(/^\//, '').toLowerCase();
+}
+
 function isDocumentationHash(): boolean {
-  if (typeof window === 'undefined') return false;
-  const raw = window.location.hash.replace(/^#/, '').replace(/^\//, '').toLowerCase();
+  const raw = hashRouteSegment();
   return raw === 'documentation' || raw === 'docs';
 }
 
-type GalleryStock = 'pexels' | 'unsplash';
+function isArchiveHash(): boolean {
+  return hashRouteSegment() === 'archive';
+}
+
+type AppPage = 'home' | 'archive' | 'documentation';
+
+function pageFromHash(): AppPage {
+  if (isDocumentationHash()) return 'documentation';
+  if (isArchiveHash()) return 'archive';
+  return 'home';
+}
+
+type GalleryStock = 'pexels' | 'unsplash' | 'google';
 
 /** 本次搜索响应来源（合并 Lookups 为 mixed） */
 type GalleryImageProvider = GalleryStock | 'mixed';
@@ -42,6 +58,23 @@ function PhotoAttribution({
   item: SearchResult;
   className?: string;
 }) {
+  if (item.stock === 'google') {
+    return (
+      <p className={cn(sourceAttributionClass, className)}>
+        Image from{' '}
+        <a
+          href={item.photographerUrl}
+          target="_blank"
+          rel="noopener noreferrer"
+          className={attributionLinkClass}
+        >
+          {item.source}
+        </a>{' '}
+        via Google Images
+      </p>
+    );
+  }
+
   const brand =
     item.stock === 'unsplash'
       ? {
@@ -79,19 +112,167 @@ function PhotoAttribution({
 
 const LIGHTBOX_HISTORY_STATE = { galleryLightbox: true as const };
 
-export default function App() {
-  const [page, setPage] = useState<'home' | 'documentation'>(() =>
-    typeof window !== 'undefined' && isDocumentationHash() ? 'documentation' : 'home',
+/**
+ * 列表/灯箱用图：第三方与 Google tbn 常按 Referer 防盗链；
+ * 不加 no-referrer 时会出现「灰底空白，点开灯箱却又能看」的情况。
+ * gstatic 缩略图改走本站 /api/image-proxy，避免浏览器跨境直连。
+ */
+function galleryDisplayUrl(url: string): string {
+  try {
+    const host = new URL(url).hostname;
+    if (
+      host === 'encrypted-tbn0.gstatic.com' ||
+      host === 'encrypted-tbn1.gstatic.com' ||
+      host === 'encrypted-tbn2.gstatic.com' ||
+      host === 'encrypted-tbn3.gstatic.com'
+    ) {
+      return `/api/image-proxy?url=${encodeURIComponent(url)}`;
+    }
+  } catch {
+    /* 非法 URL 原样交给浏览器 */
+  }
+  return url;
+}
+
+function GalleryImg({
+  item,
+  prefer,
+  alt,
+  className,
+  loading,
+}: {
+  item: SearchResult;
+  /** 列表优先缩略图（gstatic 更稳）；灯箱优先原图 */
+  prefer: 'thumbnail' | 'image';
+  alt: string;
+  className?: string;
+  loading?: 'lazy' | 'eager';
+}) {
+  const primaryRaw =
+    prefer === 'thumbnail'
+      ? item.thumbnail || item.image
+      : item.image || item.thumbnail;
+  const fallbackRaw =
+    prefer === 'thumbnail'
+      ? item.image && item.image !== primaryRaw
+        ? item.image
+        : undefined
+      : item.thumbnail && item.thumbnail !== primaryRaw
+        ? item.thumbnail
+        : undefined;
+  const primary = galleryDisplayUrl(primaryRaw);
+  const fallback = fallbackRaw ? galleryDisplayUrl(fallbackRaw) : undefined;
+  const [src, setSrc] = useState(primary);
+
+  useEffect(() => {
+    setSrc(primary);
+  }, [primary]);
+
+  return (
+    <img
+      src={src}
+      alt={alt}
+      className={className}
+      loading={loading}
+      referrerPolicy="no-referrer"
+      onError={() => {
+        if (fallback && src !== fallback) setSrc(fallback);
+      }}
+    />
   );
-  const [query, setQuery] = useState('');
-  const [results, setResults] = useState<SearchResult[]>([]);
-  const [loading, setLoading] = useState(false);
-  const [error, setError] = useState<string | null>(null);
+}
+
+type GalleryLane = 'home' | 'archive';
+
+type GallerySession = {
+  query: string;
+  results: SearchResult[];
+  loading: boolean;
+  error: string | null;
+  imageProvider: GalleryImageProvider;
+};
+
+function emptyGallerySession(
+  imageProvider: GalleryImageProvider,
+): GallerySession {
+  return {
+    query: '',
+    results: [],
+    loading: false,
+    error: null,
+    imageProvider,
+  };
+}
+
+function providerFromResponse(raw: unknown): GalleryImageProvider {
+  if (raw === 'google') return 'google';
+  if (raw === 'unsplash') return 'unsplash';
+  if (raw === 'mixed') return 'mixed';
+  return 'pexels';
+}
+
+function isAbortError(err: unknown): boolean {
+  return (
+    (err instanceof DOMException && err.name === 'AbortError') ||
+    (typeof err === 'object' &&
+      err !== null &&
+      'name' in err &&
+      (err as { name?: string }).name === 'AbortError')
+  );
+}
+
+export default function App() {
+  const [page, setPage] = useState<AppPage>(() =>
+    typeof window !== 'undefined' ? pageFromHash() : 'home',
+  );
+  const [homeSession, setHomeSession] = useState<GallerySession>(() =>
+    emptyGallerySession('mixed'),
+  );
+  const [archiveSession, setArchiveSession] = useState<GallerySession>(() =>
+    emptyGallerySession('google'),
+  );
   const [selectedImage, setSelectedImage] = useState<SearchResult | null>(null);
-  const [imageProvider, setImageProvider] =
-    useState<GalleryImageProvider>('mixed');
   /** 已为当前打开的灯箱 push 过一条 history，关闭时应 history.back 与浏览器后退一致 */
   const lightboxHistoryPushedRef = useRef(false);
+  const homeAbortRef = useRef<AbortController | null>(null);
+  const archiveAbortRef = useRef<AbortController | null>(null);
+
+  const activeLane: GalleryLane | null =
+    page === 'home' || page === 'archive' ? page : null;
+  const session =
+    activeLane === 'archive'
+      ? archiveSession
+      : activeLane === 'home'
+        ? homeSession
+        : null;
+  const { query, results, loading, error, imageProvider } = session ?? {
+    query: '',
+    results: [] as SearchResult[],
+    loading: false,
+    error: null as string | null,
+    imageProvider: 'mixed' as GalleryImageProvider,
+  };
+
+  const patchSession = useCallback(
+    (
+      lane: GalleryLane,
+      patch: Partial<GallerySession> | ((prev: GallerySession) => GallerySession),
+    ) => {
+      const apply = (prev: GallerySession) =>
+        typeof patch === 'function' ? patch(prev) : { ...prev, ...patch };
+      if (lane === 'archive') setArchiveSession(apply);
+      else setHomeSession(apply);
+    },
+    [],
+  );
+
+  const setQuery = useCallback(
+    (value: string) => {
+      if (!activeLane) return;
+      patchSession(activeLane, { query: value });
+    },
+    [activeLane, patchSession],
+  );
 
   const closeLightbox = useCallback(() => {
     if (lightboxHistoryPushedRef.current) {
@@ -123,7 +304,7 @@ export default function App() {
 
   useEffect(() => {
     const syncPageFromHash = () => {
-      setPage(isDocumentationHash() ? 'documentation' : 'home');
+      setPage(pageFromHash());
     };
     syncPageFromHash();
     window.addEventListener('hashchange', syncPageFromHash);
@@ -131,7 +312,6 @@ export default function App() {
   }, []);
 
   useEffect(() => {
-    if (page !== 'documentation') return;
     lightboxHistoryPushedRef.current = false;
     setSelectedImage(null);
   }, [page]);
@@ -147,44 +327,79 @@ export default function App() {
     window.location.hash = '#/documentation';
   }, []);
 
-  const searchImages = async (searchQuery: string) => {
-    if (!searchQuery.trim()) return;
-    setLoading(true);
-    setError(null);
-    try {
-      const response = await fetch(
-        `/api/search/combined?q=${encodeURIComponent(searchQuery)}`,
-      );
-      const data = await response.json();
-      if (!response.ok) {
-        setError(typeof data.error === 'string' ? data.error : 'Search failed.');
-        setResults([]);
-        return;
-      }
-      if (Array.isArray(data.results) && data.results.length > 0) {
-        setResults(data.results);
-        setImageProvider(
-          data.provider === 'unsplash'
-            ? 'unsplash'
-            : data.provider === 'mixed'
-              ? 'mixed'
-              : 'pexels',
+  const openArchive = useCallback(() => {
+    window.location.hash = '#/archive';
+  }, []);
+
+  const searchImages = useCallback(
+    async (searchQuery: string, lane: GalleryLane) => {
+      const trimmed = searchQuery.trim();
+      if (!trimmed) return;
+
+      const abortRef = lane === 'archive' ? archiveAbortRef : homeAbortRef;
+      abortRef.current?.abort();
+      const controller = new AbortController();
+      abortRef.current = controller;
+
+      const endpoint =
+        lane === 'archive'
+          ? '/api/search/google-images'
+          : '/api/search/combined';
+
+      patchSession(lane, {
+        query: trimmed,
+        loading: true,
+        error: null,
+      });
+
+      try {
+        const response = await fetch(
+          `${endpoint}?q=${encodeURIComponent(trimmed)}`,
+          { signal: controller.signal },
         );
-      } else {
-        setError('No results found.');
-        setResults([]);
+        const data = await response.json();
+        if (controller.signal.aborted) return;
+
+        if (!response.ok) {
+          patchSession(lane, {
+            loading: false,
+            error:
+              typeof data.error === 'string' ? data.error : 'Search failed.',
+            results: [],
+          });
+          return;
+        }
+
+        if (Array.isArray(data.results) && data.results.length > 0) {
+          patchSession(lane, {
+            loading: false,
+            error: null,
+            results: data.results,
+            imageProvider: providerFromResponse(data.provider),
+          });
+        } else {
+          patchSession(lane, {
+            loading: false,
+            error: 'No results found.',
+            results: [],
+          });
+        }
+      } catch (err) {
+        if (isAbortError(err) || controller.signal.aborted) return;
+        patchSession(lane, {
+          loading: false,
+          error: 'Failed to fetch images. Please try again.',
+          results: [],
+        });
       }
-    } catch (err) {
-      setError('Failed to fetch images. Please try again.');
-      setResults([]);
-    } finally {
-      setLoading(false);
-    }
-  };
+    },
+    [patchSession],
+  );
 
   const handleSearch = (e: React.FormEvent) => {
     e.preventDefault();
-    searchImages(query);
+    if (!activeLane) return;
+    void searchImages(query, activeLane);
   };
 
   const downloadAsset = async (item: SearchResult, filename: string) => {
@@ -210,11 +425,6 @@ export default function App() {
     link.click();
     document.body.removeChild(link);
   };
-
-  useEffect(() => {
-    if (isDocumentationHash()) return;
-    searchImages('Switzerland Alps landscape');
-  }, []);
 
   return (
     <div className="min-h-screen bg-[#FDFCFB] text-[#1A1A1A] font-sans selection:bg-[#1A1A1A] selection:text-white p-6 md:p-12 overflow-x-hidden">
@@ -248,9 +458,18 @@ export default function App() {
             >
               Discovery
             </button>
-            <span className="text-[#A5A5A5]/60 cursor-not-allowed border-b border-transparent pb-0.5">
+            <button
+              type="button"
+              onClick={openArchive}
+              className={cn(
+                'transition-colors border-b pb-0.5',
+                page === 'archive'
+                  ? 'border-[#1A1A1A] text-[#1A1A1A]'
+                  : 'border-transparent text-[#A5A5A5] hover:text-[#1A1A1A]',
+              )}
+            >
               Archive
-            </span>
+            </button>
             <button
               type="button"
               onClick={openDocumentation}
@@ -267,18 +486,28 @@ export default function App() {
         </header>
 
         {/* Main Search Area */}
-        {page === 'home' && (
+        {(page === 'home' || page === 'archive') && (
         <div className="flex flex-col items-center mb-16 px-4">
           <form onSubmit={handleSearch} className="w-full max-w-2xl relative">
             <span className="absolute -top-7 left-0 text-[10px] uppercase font-bold tracking-tighter opacity-40 italic">
-              {query ? `Refine discovery: "${query}"` : "Enter destination keyword — Powered by DuckDuckGo"}
+              {page === 'archive'
+                ? query
+                  ? `Archive query: "${query}"`
+                  : 'Licensed web photos — Google Images via SerpApi'
+                : query
+                  ? `Refine discovery: "${query}"`
+                  : 'Enter destination keyword — Pexels & Unsplash'}
             </span>
             <div className="flex border-b-2 border-[#1A1A1A] pb-2 group focus-within:border-[#F27D26] transition-colors">
               <input
                 type="text"
                 value={query}
                 onChange={(e) => setQuery(e.target.value)}
-                placeholder="e.g., Santorini Sunset Oia"
+                placeholder={
+                  page === 'archive'
+                    ? 'e.g., 清水寺 风景'
+                    : 'e.g., Santorini Sunset Oia'
+                }
                 className="bg-transparent text-2xl font-serif outline-none flex-grow placeholder:opacity-20 placeholder:italic transition-all"
               />
               <button 
@@ -307,7 +536,10 @@ export default function App() {
             <div className="h-64 flex flex-col items-center justify-center gap-4">
               <p className="font-serif italic text-xl">{error}</p>
               <button 
-                onClick={() => searchImages(query || 'Switzerland Alps')}
+                onClick={() => {
+                  if (!activeLane) return;
+                  void searchImages(query, activeLane);
+                }}
                 className="text-[11px] font-bold underline uppercase tracking-widest"
               >
                 Retry Search
@@ -323,8 +555,9 @@ export default function App() {
                 className="col-span-1 md:col-span-7 h-[400px] md:h-[600px] relative group cursor-pointer overflow-hidden bg-[#EAE8E4]"
                 onClick={() => openOrSwitchPreview(results[0])}
               >
-                <img 
-                  src={results[0].image} 
+                <GalleryImg
+                  item={results[0]}
+                  prefer="thumbnail"
                   alt={results[0].title}
                   className="w-full h-full object-cover transition-all duration-1000 grayscale-[0.3] group-hover:grayscale-0 group-hover:scale-105"
                 />
@@ -359,9 +592,10 @@ export default function App() {
                     onClick={() => openOrSwitchPreview(item)}
                   >
                     <div className="w-1/3 aspect-square bg-[#EAE8E4] overflow-hidden">
-                      <img 
-                        src={item.thumbnail || item.image} 
-                        alt={item.title} 
+                      <GalleryImg
+                        item={item}
+                        prefer="thumbnail"
+                        alt={item.title}
                         className="w-full h-full object-cover grayscale-[0.5] group-hover:grayscale-0 transition-all duration-700 hover:scale-110"
                       />
                     </div>
@@ -396,9 +630,10 @@ export default function App() {
                     onClick={() => openOrSwitchPreview(item)}
                    >
                      <div className="aspect-[4/5] bg-[#EAE8E4] overflow-hidden mb-4 rounded-sm">
-                       <img 
-                        src={item.thumbnail || item.image} 
-                        alt={item.title} 
+                       <GalleryImg
+                        item={item}
+                        prefer="thumbnail"
+                        alt={item.title}
                         className="w-full h-full object-cover grayscale-[0.6] group-hover:grayscale-0 transition-all duration-700"
                         loading="lazy"
                        />
@@ -429,7 +664,7 @@ export default function App() {
         <footer className="mt-20 pt-8 border-t border-[#1A1A1A]/10 flex flex-col md:flex-row justify-between items-center text-[10px] font-bold uppercase tracking-[0.2em] pb-12 text-[#A5A5A5]">
           <div className="flex gap-8 mb-6 md:mb-0">
             <span className="text-[#1A1A1A]">Session ID: ARCH-{Date.now().toString().slice(-4)}</span>
-            {page === 'home' && (
+            {(page === 'home' || page === 'archive') && (
               <div className="hidden sm:block">Assets in current view: {results.length}</div>
             )}
           </div>
@@ -437,11 +672,13 @@ export default function App() {
             <div className="flex items-center gap-2">
               <div className="w-1.5 h-1.5 rounded-full bg-[#00FF00] shadow-[0_0_8px_#00FF00]"></div>
               <span className="text-[#1A1A1A]">
-                {imageProvider === 'mixed'
-                  ? 'Photos via Pexels & Unsplash'
-                  : imageProvider === 'unsplash'
-                    ? 'Photos via Unsplash'
-                    : 'Photos via Pexels'}
+                {imageProvider === 'google'
+                  ? 'Photos via Google Images (SerpApi)'
+                  : imageProvider === 'mixed'
+                    ? 'Photos via Pexels & Unsplash'
+                    : imageProvider === 'unsplash'
+                      ? 'Photos via Unsplash'
+                      : 'Photos via Pexels'}
               </span>
             </div>
             <div className="w-[1px] h-3 bg-[#A5A5A5]/20"></div>
@@ -472,8 +709,9 @@ export default function App() {
               className="max-w-[1240px] w-full flex flex-col md:flex-row gap-12 items-center md:items-stretch"
             >
               <div className="flex-grow flex items-center justify-center bg-[#EAE8E4] p-4 md:p-8 rounded-sm shadow-2xl relative overflow-hidden">
-                <img
-                  src={selectedImage.image}
+                <GalleryImg
+                  item={selectedImage}
+                  prefer="image"
                   alt={selectedImage.title}
                   className="max-w-full max-h-[75vh] object-contain shadow-2xl transition-transform cursor-zoom-in"
                 />
@@ -516,7 +754,9 @@ export default function App() {
                 </div>
 
                 <div className="mt-auto opacity-50 text-[9px] uppercase tracking-widest leading-relaxed">
-                  Images are hotlinked from Pexels or Unsplash per search. Photographer and platform are credited above; use is subject to each provider&apos;s license and API guidelines.
+                  {selectedImage.stock === 'google'
+                    ? 'Images are linked from third-party sites via Google Images (SerpApi, licenses=fmc filter). Verify rights on the source page before commercial use.'
+                    : 'Images are hotlinked from Pexels or Unsplash per search. Photographer and platform are credited above; use is subject to each provider\'s license and API guidelines.'}
                 </div>
               </div>
             </motion.div>

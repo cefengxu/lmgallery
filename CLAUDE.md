@@ -39,6 +39,9 @@ SEARCH_UNSPLASH_PER_PAGE=3         # /api/search/unsplash only (1–30)
 SEARCH_COMBINED_PER_PAGE=3         # /api/search/combined total before split (1–80)
 PEXELS_IMAGE_MAX_EDGE=             # optional max long-edge px for CDN variant pick
 
+SERPAPI_API_KEY=                   # required for /api/search/google-images (Archive)
+SEARCH_SERPAPI_PER_PAGE=20         # google-images result slice 1–100
+
 ALLOWED_HOSTS=true                 # optional; Vite allowedHosts: true (nginx reverse-proxy)
 GEMINI_API_KEY=                    # optional; injected at build time via Vite define
 DISABLE_HMR=true                   # optional; disable Vite HMR (e.g. AI Studio)
@@ -76,6 +79,7 @@ Single-file Express server. Key API routes:
 | `/api/search/pexels` | GET/POST | Pexels-only (`?q=` or body `{q, keyword}`) |
 | `/api/search/unsplash` | GET/POST | Unsplash-only |
 | `/api/search/combined` | GET/POST | Parallel Pexels + Unsplash — used by the SPA |
+| `/api/search/google-images` | GET/POST | SerpApi Google Images (Archive page `#/archive`) |
 | `/api/unsplash/track-download` | POST | Unsplash download tracking (`{downloadLocation}`) |
 
 **Combined search:** `SEARCH_COMBINED_PER_PAGE` total is randomly split 5:5 or 4:6 between Pexels and Unsplash; results merged and shuffled. Does not use the single-source per-page vars. Unsplash share capped at 30 (API limit). Response may include `mix` (`splitMode`, requested counts).
@@ -85,13 +89,13 @@ Single-file Express server. Key API routes:
 
 **Image variant selection:** `pickPexelsMainImage` / `pickUnsplashMainImage` pick the best CDN URL within `PEXELS_IMAGE_MAX_EDGE`. Without the limit: Pexels prefers `large2x` → `large` → `original`; Unsplash defaults toward `regular` (~1080px).
 
-**Types / response shape:** searches return `{ query, count, results, provider }` (and optional `mix`). Each item is `GallerySearchResultItem`: `title`, `image`, `thumbnail`, `url`, `width`, `height`, `source`, `stock` (`pexels` \| `unsplash`), `photographerUrl`, optional `unsplashDownloadLocation`. Provider is `GalleryImageProvider` (`pexels` \| `unsplash` \| `mixed`).
+**Types / response shape:** searches return `{ query, count, results, provider }` (and optional `mix`). Each item is `GallerySearchResultItem`: `title`, `image`, `thumbnail`, `url`, `width`, `height`, `source`, `stock` (`pexels` \| `unsplash` \| `google`), `photographerUrl`, optional `unsplashDownloadLocation`. Provider is `GalleryImageProvider` (`pexels` \| `unsplash` \| `google` \| `mixed`).
 
 In production (`NODE_ENV=production`), Express serves `dist/` with SPA fallback. In development, Vite middleware handles HMR.
 
 ### Frontend (`src/`)
 
-**Routing:** hash-based — `#/documentation` or `#/docs` → Documentation; otherwise home/search. No router library.
+**Routing:** hash-based — `#/documentation` or `#/docs` → Documentation; `#/archive` → SerpApi Google Images gallery; otherwise Discovery (combined search). No router library.
 
 **App.tsx** — main UI:
 - Search → `GET /api/search/combined?q=`

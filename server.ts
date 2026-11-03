@@ -71,6 +71,42 @@ const SEARCH_COMBINED_PER_PAGE = searchPerPageFromEnv(
   'SEARCH_COMBINED_PER_PAGE',
   { defaultValue: 3, max: 80 },
 );
+/** /api/search/google-images：从 SerpApi 单页结果截取条数（1–100）。 */
+const SEARCH_SERPAPI_PER_PAGE = searchPerPageFromEnv('SEARCH_SERPAPI_PER_PAGE', {
+  defaultValue: 20,
+  max: 100,
+});
+
+const SERPAPI_SEARCH = 'https://serpapi.com/search.json';
+
+/** 浏览器直连 gstatic 在部分网络很慢；只允许这些缩略图域名走本站代理。 */
+const GSTATIC_THUMB_HOSTS = new Set([
+  'encrypted-tbn0.gstatic.com',
+  'encrypted-tbn1.gstatic.com',
+  'encrypted-tbn2.gstatic.com',
+  'encrypted-tbn3.gstatic.com',
+]);
+const THUMB_PROXY_MAX_BYTES = 1_500_000;
+const thumbProxyCache = new Map<
+  string,
+  { body: Buffer; contentType: string; at: number }
+>();
+const THUMB_PROXY_CACHE_MS = 60 * 60 * 1000;
+const THUMB_PROXY_CACHE_MAX = 200;
+
+function gstaticThumbUrl(raw: string): URL | null {
+  let parsed: URL;
+  try {
+    parsed = new URL(raw);
+  } catch {
+    return null;
+  }
+  if (parsed.protocol !== 'https:') return null;
+  if (!GSTATIC_THUMB_HOSTS.has(parsed.hostname)) return null;
+  return parsed;
+}
+const SERPAPI_GOOGLE_IMAGES_JSON_RESTRICTOR =
+  'images_results[].{position,title,source,original,original_width,original_height,link,thumbnail}';
 
 /**
  * 下载/展示主图的最长边上限（像素）。不设或空 = 不强制压缩档位，优先 large2x → large → original。
@@ -99,7 +135,7 @@ function scaledDims(
 }
 
 /** 单张作品的来源 */
-export type GalleryStock = 'pexels' | 'unsplash';
+export type GalleryStock = 'pexels' | 'unsplash' | 'google';
 
 /** 单次搜索响应层面的来源（合并接口为 mixed） */
 export type GalleryImageProvider = GalleryStock | 'mixed';
@@ -626,6 +662,142 @@ async function runUnsplashGallerySearch(
   }
 }
 
+type SerpApiGoogleImagesResponse = {
+  images_results?: Array<{
+    title?: string;
+    source?: string;
+    original?: string;
+    original_width?: number;
+    original_height?: number;
+    link?: string;
+    thumbnail?: string;
+  }>;
+  error?: string;
+};
+
+/** SerpApi Google Images（Archive）；检索参数除 q 外固定，见 docs/T82.md。 */
+async function runGoogleImagesGallerySearch(
+  query: string,
+): Promise<SearchOk | SearchErr> {
+  const trimmed = query.trim();
+  if (!trimmed) {
+    return {
+      ok: false,
+      status: 400,
+      body: { error: 'Missing search keyword (use q or keyword).' },
+    };
+  }
+
+  const apiKey = process.env.SERPAPI_API_KEY?.trim();
+  if (!apiKey) {
+    return {
+      ok: false,
+      status: 503,
+      body: {
+        error:
+          'SERPAPI_API_KEY is not set. Add it to .env for Google Images search.',
+      },
+    };
+  }
+
+  const limit = SEARCH_SERPAPI_PER_PAGE;
+
+  try {
+    const { data } = await axios.get<SerpApiGoogleImagesResponse>(
+      SERPAPI_SEARCH,
+      {
+        params: {
+          engine: 'google_images',
+          q: trimmed,
+          hl: 'zh-cn',
+          gl: 'cn',
+          image_type: 'photo',
+          imgsz: 'm',
+          imgar: 'w',
+          // licenses: 'fmc',
+          ijn: 0,
+          json_restrictor: SERPAPI_GOOGLE_IMAGES_JSON_RESTRICTOR,
+          api_key: apiKey,
+        },
+        timeout: 45_000,
+      },
+    );
+
+    if (typeof data.error === 'string' && data.error.trim()) {
+      return {
+        ok: false,
+        status: 502,
+        body: { error: data.error.trim() },
+      };
+    }
+
+    const raw = data.images_results ?? [];
+    const results: GallerySearchResultItem[] = [];
+    for (const item of raw) {
+      const original =
+        typeof item.original === 'string' ? item.original.trim() : '';
+      if (!original) continue;
+
+      const link =
+        typeof item.link === 'string' && item.link.trim()
+          ? item.link.trim()
+          : original;
+      const w = Number(item.original_width);
+      const h = Number(item.original_height);
+      const width = Number.isFinite(w) && w > 0 ? w : 800;
+      const height = Number.isFinite(h) && h > 0 ? h : 600;
+      const site =
+        typeof item.source === 'string' && item.source.trim()
+          ? item.source.trim()
+          : 'Web';
+      const title =
+        typeof item.title === 'string' && item.title.trim()
+          ? item.title.trim()
+          : site;
+
+      results.push({
+        title,
+        image: original,
+        thumbnail:
+          typeof item.thumbnail === 'string' && item.thumbnail.trim()
+            ? item.thumbnail.trim()
+            : original,
+        url: link,
+        width,
+        height,
+        source: site,
+        stock: 'google',
+        photographerUrl: link,
+      });
+
+      if (results.length >= limit) break;
+    }
+
+    return { ok: true, query: trimmed, results, provider: 'google' };
+  } catch (error: unknown) {
+    const err = error as {
+      message?: string;
+      response?: { status?: number; data?: { error?: string } };
+    };
+    const detail =
+      err.response?.data?.error || err.message || 'Request failed';
+    console.error('SerpApi Google Images error:', detail);
+    const status = err.response?.status;
+    if (status === 401 || status === 403) {
+      return {
+        ok: false,
+        status: 401,
+        body: { error: 'Invalid or unauthorized SerpApi API key.' },
+      };
+    }
+    return {
+      ok: false,
+      status: 502,
+      body: { error: 'Failed to fetch images from Google Images (SerpApi).' },
+    };
+  }
+}
+
 function parseSearchKeywordBody(
   body: { q?: unknown; keyword?: unknown } | undefined,
 ): string {
@@ -733,6 +905,93 @@ async function startServer() {
       req.body as { q?: unknown; keyword?: unknown } | undefined,
     );
     const out = await runUnsplashGallerySearch(qRaw);
+    if (out.ok === false) {
+      return res.status(out.status).json(out.body);
+    }
+    return res.json(
+      jsonSearchPayload(out.query, out.results, out.provider, out.mix),
+    );
+  });
+
+  /** Google Images（SerpApi）：GET/POST，参数形态与 /api/search/pexels 一致 */
+  app.get('/api/search/google-images', async (req, res) => {
+    const query = (req.query.q as string)?.trim();
+    if (!query) {
+      return res.status(400).json({ error: 'Missing query parameter q' });
+    }
+    const out = await runGoogleImagesGallerySearch(query);
+    if (out.ok === false) {
+      return res.status(out.status).json(out.body);
+    }
+    return res.json(
+      jsonSearchPayload(out.query, out.results, out.provider, out.mix),
+    );
+  });
+
+  /**
+   * 同源转发 Google 缩略图。浏览器直连 encrypted-tbn*.gstatic.com 在部分网络很慢；
+   * 服务端到 gstatic 通常更快。仅允许上述域名，不跟随跳转。
+   */
+  app.get('/api/image-proxy', async (req, res) => {
+    const raw = typeof req.query.url === 'string' ? req.query.url : '';
+    const target = gstaticThumbUrl(raw);
+    if (!target) {
+      return res.status(400).json({ error: 'Unsupported image URL' });
+    }
+
+    const cacheKey = target.toString();
+    const hit = thumbProxyCache.get(cacheKey);
+    if (hit && Date.now() - hit.at < THUMB_PROXY_CACHE_MS) {
+      res.setHeader('Content-Type', hit.contentType);
+      res.setHeader('Cache-Control', 'public, max-age=3600');
+      res.setHeader('X-Thumb-Cache', 'hit');
+      return res.send(hit.body);
+    }
+
+    try {
+      const upstream = await axios.get<ArrayBuffer>(cacheKey, {
+        responseType: 'arraybuffer',
+        timeout: 12_000,
+        maxRedirects: 0,
+        headers: {
+          Accept: 'image/avif,image/webp,image/*,*/*;q=0.8',
+          'User-Agent': 'lmgallery-thumb-proxy',
+        },
+        validateStatus: (status) => status >= 200 && status < 300,
+      });
+      const body = Buffer.from(upstream.data);
+      if (body.length === 0 || body.length > THUMB_PROXY_MAX_BYTES) {
+        return res.status(502).json({ error: 'Thumbnail payload out of range' });
+      }
+      const contentType = String(
+        upstream.headers['content-type'] ?? 'image/jpeg',
+      )
+        .split(';')[0]
+        .trim();
+      if (!contentType.startsWith('image/')) {
+        return res.status(502).json({ error: 'Upstream did not return an image' });
+      }
+      if (thumbProxyCache.size >= THUMB_PROXY_CACHE_MAX) {
+        const oldest = thumbProxyCache.keys().next().value;
+        if (oldest) thumbProxyCache.delete(oldest);
+      }
+      thumbProxyCache.set(cacheKey, { body, contentType, at: Date.now() });
+      res.setHeader('Content-Type', contentType);
+      res.setHeader('Cache-Control', 'public, max-age=3600');
+      res.setHeader('X-Thumb-Cache', 'miss');
+      return res.send(body);
+    } catch (error: unknown) {
+      const detail = error instanceof Error ? error.message : 'proxy failed';
+      console.error('Thumbnail proxy error:', detail);
+      return res.status(502).json({ error: 'Failed to fetch thumbnail' });
+    }
+  });
+
+  app.post('/api/search/google-images', async (req, res) => {
+    const qRaw = parseSearchKeywordBody(
+      req.body as { q?: unknown; keyword?: unknown } | undefined,
+    );
+    const out = await runGoogleImagesGallerySearch(qRaw);
     if (out.ok === false) {
       return res.status(out.status).json(out.body);
     }
